@@ -1,5 +1,6 @@
 import { NextRequest, NextResponse } from "next/server";
 import { callModelForJSON } from "@/lib/llm";
+import { clientKey, isRateLimited } from "@/lib/rateLimit";
 
 type GenerateResponse = {
   concepts: string[];
@@ -13,6 +14,10 @@ type GenerateResponse = {
 };
 
 export async function POST(req: NextRequest) {
+  if (isRateLimited(clientKey(req))) {
+    return NextResponse.json({ error: "Too many requests — wait a minute and try again." }, { status: 429 });
+  }
+
   const { notes } = await req.json();
   if (!notes || typeof notes !== "string" || notes.trim().length < 20) {
     return NextResponse.json({ error: "Paste at least a few sentences of notes." }, { status: 400 });

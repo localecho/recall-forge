@@ -1,5 +1,6 @@
 import { NextRequest, NextResponse } from "next/server";
 import { callModelForJSON } from "@/lib/llm";
+import { clientKey, isRateLimited } from "@/lib/rateLimit";
 
 type FollowupResponse = {
   question: string;
@@ -8,6 +9,10 @@ type FollowupResponse = {
 };
 
 export async function POST(req: NextRequest) {
+  if (isRateLimited(clientKey(req))) {
+    return NextResponse.json({ error: "Too many requests â€” wait a minute and try again." }, { status: 429 });
+  }
+
   const { notes, concept, missedQuestion } = await req.json();
   if (!notes || !concept || !missedQuestion) {
     return NextResponse.json({ error: "notes, concept, and missedQuestion are required" }, { status: 400 });
@@ -19,7 +24,10 @@ concept from a different angle than the missed question (don't just reword it) â
 most likely to reveal the actual misunderstanding. Return ONLY JSON, no prose:
 {"question": string, "choices": [string,string,string,string], "answerIndex": number}`;
 
-  const user = `NOTES:\n${String(notes).slice(0, 8000)}\n\nCONCEPT: ${concept}\n\nMISSED QUESTION: ${missedQuestion}`;
+  const user = `NOTES:\n${String(notes).slice(0, 8000)}\n\nCONCEPT: ${String(concept).slice(
+    0,
+    200
+  )}\n\nMISSED QUESTION: ${String(missedQuestion).slice(0, 500)}`;
 
   try {
     const result = await callModelForJSON<FollowupResponse>(system, user);

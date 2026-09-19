@@ -1,6 +1,6 @@
 "use client";
 
-import { useMemo, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { ConceptState, gradeAnswer, initConcept, mastery, nextConcept } from "@/lib/srs";
 
 type Question = {
@@ -45,8 +45,70 @@ export default function Page() {
   // follow-up response that lands after the user has already moved on
   // doesn't silently steal focus back to a stale question.
   const followupTokenRef = useRef(0);
+  const hydratedRef = useRef(false);
 
   const started = conceptStates.length > 0;
+
+  // Per-viewer convenience only: a mid-demo refresh (or an accidental tab
+  // close while recording the submission video) must not throw away the
+  // quiz. Never assumed to persist across devices/browsers — it's just
+  // this browser's localStorage, wrapped so a private-window throw can't
+  // break rendering.
+  useEffect(() => {
+    try {
+      const raw = localStorage.getItem("recall-forge-session");
+      if (raw) {
+        const saved = JSON.parse(raw);
+        setNotes(saved.notes || "");
+        setQuestionsByConcept(new Map(saved.questionsByConcept || []));
+        setConceptStates(saved.conceptStates || []);
+        setCurrent(saved.current || null);
+        setSelected(saved.selected ?? null);
+        setFeedback(saved.feedback ?? null);
+        setAnsweredCount(saved.answeredCount || 0);
+      }
+    } catch {
+      // corrupted or blocked storage — just start fresh
+    } finally {
+      hydratedRef.current = true;
+    }
+  }, []);
+
+  useEffect(() => {
+    if (!hydratedRef.current) return; // don't clobber saved state with the initial empty render
+    try {
+      localStorage.setItem(
+        "recall-forge-session",
+        JSON.stringify({
+          notes,
+          questionsByConcept: Array.from(questionsByConcept.entries()),
+          conceptStates,
+          current,
+          selected,
+          feedback,
+          answeredCount,
+        })
+      );
+    } catch {
+      // private window / storage full / blocked — session just won't survive a refresh
+    }
+  }, [notes, questionsByConcept, conceptStates, current, selected, feedback, answeredCount]);
+
+  function startOver() {
+    try {
+      localStorage.removeItem("recall-forge-session");
+    } catch {
+      // ignore
+    }
+    setNotes("");
+    setQuestionsByConcept(new Map());
+    setConceptStates([]);
+    setCurrent(null);
+    setSelected(null);
+    setFeedback(null);
+    setAnsweredCount(0);
+    setError(null);
+  }
 
   async function generateQuiz() {
     setLoading(true);
@@ -219,6 +281,11 @@ export default function Page() {
 
       {started && (
         <div>
+          <div style={{ display: "flex", justifyContent: "flex-end", marginBottom: 8 }}>
+            <button onClick={startOver} style={linkBtn}>
+              Start over with new notes
+            </button>
+          </div>
           <MasteryBar conceptStates={conceptStates} overall={overallMastery} answeredCount={answeredCount} />
 
           {current ? (
