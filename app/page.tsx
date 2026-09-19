@@ -1,6 +1,6 @@
 "use client";
 
-import { useMemo, useState } from "react";
+import { useMemo, useRef, useState } from "react";
 import { ConceptState, gradeAnswer, initConcept, mastery, nextConcept } from "@/lib/srs";
 
 type Question = {
@@ -11,18 +11,40 @@ type Question = {
   answerIndex: number;
 };
 
+// A model-chosen concept can legally be the string "constructor" or
+// "hasOwnProperty" — using a plain object as a concept->questions map lets
+// that string resolve to an inherited Object.prototype function instead of
+// undefined, breaking the grouping logic. A Map has no such collisions.
+function isValidQuestion(q: any): q is Question {
+  return (
+    q &&
+    typeof q.concept === "string" &&
+    typeof q.question === "string" &&
+    Array.isArray(q.choices) &&
+    q.choices.length === 4 &&
+    q.choices.every((c: any) => typeof c === "string") &&
+    Number.isInteger(q.answerIndex) &&
+    q.answerIndex >= 0 &&
+    q.answerIndex < 4
+  );
+}
+
 export default function Page() {
   const [notes, setNotes] = useState("");
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
-  const [questionsByConcept, setQuestionsByConcept] = useState<Record<string, Question[]>>({});
+  const [questionsByConcept, setQuestionsByConcept] = useState<Map<string, Question[]>>(new Map());
   const [conceptStates, setConceptStates] = useState<ConceptState[]>([]);
   const [current, setCurrent] = useState<Question | null>(null);
   const [selected, setSelected] = useState<number | null>(null);
   const [feedback, setFeedback] = useState<"correct" | "wrong" | null>(null);
   const [regenerating, setRegenerating] = useState(false);
   const [answeredCount, setAnsweredCount] = useState(0);
+  // Bumped on every "wrong answer" and every manual skip, so a slow
+  // follow-up response that lands after the user has already moved on
+  // doesn't silently steal focus back to a stale question.
+  const followupTokenRef = useRef(0);
 
   const started = conceptStates.length > 0;
 
@@ -38,16 +60,31 @@ export default function Page() {
       const data = await res.json();
       if (!res.ok) throw new Error(data.error || "generation failed");
 
-      const byConcept: Record<string, Question[]> = {};
-      for (const q of data.questions as Question[]) {
-        byConcept[q.concept] = byConcept[q.concept] ? [...byConcept[q.concept], q] : [q];
+      const rawQuestions = Array.isArray(data.questions) ? data.questions : [];
+      const validQuestions = rawQuestions.filter(isValidQuestion) as Question[];
+
+      const byConcept = new Map<string, Question[]>();
+      for (const q of validQuestions) {
+        byConcept.set(q.concept, [...(byConcept.get(q.concept) || []), q]);
       }
-      const states = (data.concepts as string[]).map((c) => initConcept(c));
+
+      // Only keep concepts that actually got a valid question — a concept
+      // the model listed but never wrote a usable question for must not
+      // enter the scheduler, or the first pick throws on an empty array.
+      const usableConcepts = (Array.isArray(data.concepts) ? data.concepts : []).filter(
+        (c: unknown) => typeof c === "string" && byConcept.has(c)
+      ) as string[];
+
+      if (usableConcepts.length === 0) {
+        throw new Error("The model didn't return any usable questions — try pasting more detailed notes.");
+      }
+
+      const states = usableConcepts.map((c) => initConcept(c));
       setQuestionsByConcept(byConcept);
       setConceptStates(states);
       setAnsweredCount(0);
       const first = nextConcept(states);
-      setCurrent(first ? byConcept[first.concept][0] : null);
+      setCurrent(first ? byConcept.get(first.concept)![0] : null);
       setSelected(null);
       setFeedback(null);
     } catch (e: any) {
@@ -74,39 +111,54 @@ export default function Page() {
     }
 
     // Wrong: immediately forge a targeted follow-up question on the same concept.
+    const missedConcept = current.concept;
+    const missedQuestionText = current.question;
+    const myToken = ++followupTokenRef.current;
     setRegenerating(true);
     try {
       const res = await fetch("/api/followup", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ notes, concept: current.concept, missedQuestion: current.question }),
+        body: JSON.stringify({ notes, concept: missedConcept, missedQuestion: missedQuestionText }),
       });
       const data = await res.json();
-      if (res.ok) {
-        const newQ: Question = {
-          id: `${current.concept}-${Date.now()}`,
-          concept: current.concept,
-          question: data.question,
-          choices: data.choices,
-          answerIndex: data.answerIndex,
-        };
-        setQuestionsByConcept((prev) => ({
-          ...prev,
-          [current.concept]: [...(prev[current.concept] || []), newQ],
-        }));
+      const candidate = { concept: missedConcept, ...data };
+      if (res.ok && isValidQuestion(candidate)) {
+        const newQ: Question = { ...candidate, id: `${missedConcept}-${Date.now()}` };
+        setQuestionsByConcept((prev) => {
+          const next = new Map(prev);
+          next.set(missedConcept, [...(next.get(missedConcept) || []), newQ]);
+          return next;
+        });
+        // Only steal focus back to this question if the user hasn't already
+        // moved on to something else while the model call was in flight.
+        if (followupTokenRef.current === myToken) {
+          setCurrent(newQ);
+          setSelected(null);
+          setFeedback(null);
+        }
+      } else if (followupTokenRef.current === myToken) {
+        setError("Couldn't forge a follow-up question — skip ahead and it'll retry next time this concept comes due.");
+      }
+    } catch {
+      if (followupTokenRef.current === myToken) {
+        setError("Couldn't forge a follow-up question (network error) — skip ahead.");
       }
     } finally {
-      setRegenerating(false);
+      if (followupTokenRef.current === myToken) setRegenerating(false);
     }
   }
 
   function nextQuestion() {
+    followupTokenRef.current++; // any in-flight follow-up for the skipped question is now stale
+    setRegenerating(false);
+    setError(null);
     const picked = nextConcept(conceptStates);
     if (!picked) {
       setCurrent(null);
       return;
     }
-    const pool = questionsByConcept[picked.concept] || [];
+    const pool = questionsByConcept.get(picked.concept) || [];
     const q = pool[pool.length - 1] || pool[0];
     setCurrent(q || null);
     setSelected(null);
@@ -212,11 +264,17 @@ export default function Page() {
                   </button>
                 </p>
               )}
-              {feedback === "wrong" && (
+              {feedback === "wrong" && regenerating && (
                 <p style={{ color: "#f0665e" }}>
-                  {regenerating
-                    ? "Not quite — forging a follow-up question on this concept..."
-                    : "Not quite — a follow-up question just appeared below. Try it now, or:"}{" "}
+                  Not quite — forging a follow-up question on this concept...{" "}
+                  <button onClick={nextQuestion} style={linkBtn}>
+                    skip to next →
+                  </button>
+                </p>
+              )}
+              {error && (
+                <p style={{ color: "#f0665e" }}>
+                  {error}{" "}
                   <button onClick={nextQuestion} style={linkBtn}>
                     skip to next →
                   </button>
